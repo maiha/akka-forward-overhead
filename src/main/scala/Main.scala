@@ -2,26 +2,23 @@ import akka.actor._
 import scala.concurrent.duration._
 import akka.pattern.ask
 import scala.concurrent.ExecutionContext.Implicits.global
+import akka.util.Timeout
+import scala.concurrent.Await
+import scala.concurrent.Future
 
 case object Up
-case object Done
-case object State
-case class Counted(num: Long)
 
-class CountActor extends Actor {
+class CountActor(max: Int) extends Actor {
   var count = 0L
-  var done  = false
 
   override def receive = {
-    case Up    => count += 1
-    case Done  => done = true
-    case State if done == true => sender() ! Done
-    case State => // nop
+    case Up => count += 1
+    case msg: String => sender() ! msg
   }
 }
 
-class RootActor extends Actor {
-  val counter = context.actorOf(Props[CountActor])
+class RootActor(max: Int) extends Actor {
+  val counter = context.actorOf(Props(new CountActor(max)))
   override def receive = {
     case msg => counter forward msg
   }
@@ -37,46 +34,38 @@ object Main {
   def main(args: Array[String]): Unit = {
     val system = ActorSystem("StressTest")
     args.toList match {
-      case "direct"  :: i :: Nil => run(system.actorOf(Props[CountActor]), i.toInt)
-      case "forward" :: i :: Nil => run(system.actorOf(Props[RootActor ]), i.toInt)
+      case "direct"  :: i :: Nil => run(system.actorOf(Props(new CountActor(i.toInt))), i.toInt)
+      case "forward" :: i :: Nil => run(system.actorOf(Props(new RootActor (i.toInt))), i.toInt)
       case _ => println("usage: run (direct|forward) nrMax")
     }
     system.shutdown
-    system.awaitTermination(60.seconds)
   }
 
   def run(counter: ActorRef, max: Int) {
-    val msec = time { execute(counter, max) }
-    report(max, msec)
-  }
-
-  def report(max: Int, msec: Long) {
-    println(s"${max/1000/1000}M $msec msec")
+    execute(counter, max)
   }
 
   def execute(counter: ActorRef, max: Int) {
+    val runtime = Runtime.getRuntime()
+    val now = System.nanoTime
+
     for(i <- 1 to max) counter ! Up
-    counter ! Done
+    import runtime.{ totalMemory, freeMemory, maxMemory }
+    var usedMb = (totalMemory - freeMemory) / 1024 / 1024
+    waitActor(counter)
+    val msec = (System.nanoTime - now) / 1000 / 1000
 
-    implicit val timeout = akka.util.Timeout(100)
-    var done = false
-
-    var i = 0
-    while (i < 1000 && !done) {
-      val future = counter.ask(State)
-      future onSuccess {
-        case Done =>
-          done = true
-        case _ =>
-      }
-    }
+    println(s"${max/1000/1000}M $msec msec # mem: ${usedMb}MB")
   }
 
-  private def time[A](a: => A): Long = {
-    val now = System.nanoTime
-    val result = a
-    val msec = (System.nanoTime - now) / 1000 / 1000
-    return msec
+  def waitActor(ref: ActorRef) {
+    implicit val system = ActorSystem("sniffer")
+    val inbox = ActorDSL.inbox()
+    inbox.send(ref, "done")
+    inbox.select(10.seconds) {
+      case x: String => println(s"inbox: ${x}")
+    }
+    system.shutdown
   }
 }
 
